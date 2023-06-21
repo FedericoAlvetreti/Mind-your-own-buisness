@@ -1,0 +1,1027 @@
+---
+title: "SDS Homework 1"
+author: "Alvetreti, Corrias, Di Nino, Omar"
+date: "2022-12-02"
+output:
+  prettydoc::html_pretty:
+    theme: architect
+    highlight: github
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = F)
+
+# Load libraries
+library(LaplacesDemon)
+library(VGAM)
+library(foreach)
+library(iterators)
+library(doParallel)
+
+# Set up parallelization
+n_cores <- detectCores()
+registerDoParallel(cores = n_cores)
+
+```
+
+## Exercise 1: Stat4Race
+
+To achieve the fastest possible algorithm we started implementing a vectorized method.
+
+The logic behind it is the following:
+- for each iteration we draw the same number of values of the sample x from Y
+- we check for each x if the correspondent y is greater or not
+- finally we save the number of x that found a greater y
+
+At the end of each iteration the size of x to check decreases, but it takes each time more time to find a bigger y.
+
+For this reason we implemented an early stop option which will stop the simulation after 99.9% of x-es found a bigger y.
+
+```{r vectorized, echo=FALSE}
+  
+vectorized_sim <- function(x, early_stop = T) {
+
+    # Set seed
+    set.seed(13112221)
+    
+    sim_size <- length(x)
+    
+    stopped_counts <- c() # Initialize a vector to count x-es for each stop time
+    
+    # If early_stop is selected we stop after 99.9% x-es have found a y bigger than themselves
+    x_lim <- ifelse(early_stop, sim_size %/% 1000, 0)
+    
+    while(length(x) > x_lim) {
+      
+      y <- runif(length(x)) # Draw a y for each x
+      
+      stopped_counts <- append(stopped_counts, sum(y < x))
+      
+      x <- x[x <= y] # Remove stopped x-es
+    }
+    
+    return(stopped_counts)
+  }
+
+```
+
+To improve even more the performance we implemented a parallel version of the method above which takes advantage of all the available cores of the CPU to speed up the process.
+
+```{r parallell, echo=TRUE}
+
+parallel_sim <- function(M) {
+  
+  # Set seed
+  set.seed(13112221)
+  
+  # Core Logic
+  vectorized_sim <- function(x, early_stop = T) {
+    
+    sim_size <- length(x)
+    
+    stopped_counts <- c() # Count x-es for each stop time
+    
+    # If early_stop is selected we stop after 99.9% x-es 
+    # have found a y bigger than themselves
+    x_lim <-ifelse(early_stop, sim_size %/% 1000, 0)
+    
+    while(length(x) > x_lim) {
+      
+      y <- runif(length(x)) # Draw a y for each x
+      
+      stopped_counts <- append(stopped_counts, sum(y < x))
+      
+      x <- x[x <= y] # Remove stopped x-es
+    }
+    
+    return(stopped_counts)
+  }
+  
+  # Parallelize iterations
+  stopped_counts <- foreach(x_chunk = irunif(M %/% n_cores, 
+                                             count = n_cores)) %dopar% {
+    vectorized_sim(x_chunk)
+  }
+  
+  # Make each list of the same length
+  equalize_vectors <- function(list) {
+    Map(function(x, y) {c(x, rep(0, y))}, 
+        list, 
+        max(lengths(list)) - lengths(list))
+  }
+  
+  stopped_counts <- equalize_vectors(stopped_counts)
+  
+  # Sum each list and normalize
+  return(Reduce("+", stopped_counts) / M)
+  
+}
+
+```
+
+Compare the parallel simulation with size 1000000 with the actual target distribution.
+
+```{r plot, echo=TRUE}
+
+compare_sim <- function(x) {
+  
+  plot(c(1 : length(x)), x,
+       type = "h",
+       xlab = "Time",
+       ylab = "Stopped X's",
+       xlim = c(-1, 100),
+       col = "blue",
+       lwd = 4,
+       main = ("Simulation")
+  )
+  
+  # Target Distribution
+  target_distro <- function(t) (t > 0) / (t^2 + t)
+  
+  curve(target_distro, col = "orange", lwd = 3, add = T)
+}
+
+compare_sim(parallel_sim(1000000))
+```
+
+We evaluated our 3 different approaches for 6 different simulation sizes. 
+Below we can observe a benchmark report of them.
+
+```{r benchmark, echo=FALSE}
+
+# Simulation sizes
+mm = c(100, 1000, 10000, 100000, 1000000, 10000000)
+
+times <- matrix(data = NA,nrow = 3,ncol = 6)
+colnames(times) <- mm
+rownames(times) <- c("Vectorized", 
+                     "Vectorized Approximated", 
+                     "Parallell (Approximated)") 
+
+for (i in 1:length(mm)) {
+  
+  m = mm[i]
+  
+  # Vectorized Method
+  
+  #begin <- Sys.time()
+  
+  #my_sim <- vectorized_sim(runif(m), early_stop = F)
+  
+  #times[1, i] <- Sys.time() - begin
+  
+  # Vectorized Method with Approximation
+  
+  begin <- Sys.time()
+  
+  my_sim <- vectorized_sim(runif(m), early_stop = T)
+  
+  times[2, i] <- Sys.time() - begin
+  
+  # Parallell Method with Approximation
+  
+  begin <- Sys.time()
+  
+  my_sim <- parallel_sim(m)
+  
+  times[3, i] <- Sys.time() - begin
+  
+}
+```
+
+
+```{r benchmark_result, echo=FALSE, results='asis'}
+knitr::kable(times)
+#data.frame(times)
+
+```
+
+Finally we used the fastest method to evaluate how the simulation size impact over the approximation of the target Distribution.
+
+```{r size_impact, echo=TRUE}
+
+MSEs <- c()
+
+for (m in mm) {
+  
+  sim <- parallel_sim(m)
+  
+  # Get points from the target distribution
+  target_distro <- function(t) (t > 0) / (t^2 + t)
+  target_points <- target_distro(c(1:length(sim)))
+  
+  # Calculate the gap between the two
+  diff <- (target_points - sim)
+  
+  # Get the mean square error
+  MSEs <- append(MSEs, mean(diff^2))
+  
+}
+
+plot(MSEs,
+     type = "l",
+     main = "Impact of Simulation Size",
+     xlab = "Simulation Size",
+     xaxt = "n",
+     ylab = "MSE",
+     col = "blue",
+     lwd = 3
+)
+axis(1, at=1:length(mm), labels=mm) # Add simulation sizes as x-values label
+
+```
+
+## Exercise 2.1: Privatization
+
+```{r functions, echo=TRUE}
+
+quadratic_distance<-function(x, f, g){
+  return((f(x) - g(x))^2)
+}
+
+# associated distro as a function (we will need it to integrate)
+original_distro <- function(x){
+  return(dbeta(x, 10, 10))
+}
+
+#  histogram as a step function (again we need it to integrate later)
+P_cap<-function(x){
+  pos<-(x %/% (1/m))
+  
+  return(original_histo$density[pos+1])
+}
+
+# priv_histo as a function, needed to integrate
+Q_cap <- function(x){
+  pos<-(x %/% (1/m))
+  
+  return(priv_histo$counts[pos+1])
+}
+
+```
+
+Setting parameters
+
+```{r parameters, echo=TRUE}
+
+n <- 1000       # number of observations
+m <- 30         # number of bins
+
+epsilon <- 0.1  # fixing epsilon
+```
+
+Getting original distributions and histograms
+
+```{r original_histo, echo=TRUE}
+
+# original sample
+original_sample <- rbeta(n,10,10)
+
+# histogram and curve 
+original_histo = hist(original_sample,    
+             breaks = c(0:m)*1/m ,
+             xlim = c(0,1),
+             prob = T)
+curve(original_distro(x),
+      col='darkred',
+      lwd=3,
+      add=T)
+
+```
+
+Getting privatized histogram
+
+```{r privatized_histo, echo=TRUE}
+
+# saving the hist structure
+priv_histo<-original_histo
+
+# noise used to privatize our data set
+noise <- rlaplace(m,scale=(2/epsilon),location = 0) 
+
+# adding the noise, this is D_j
+priv_histo$counts <- priv_histo$counts + noise 
+
+# taking the max between (0,D_j), this is D_j tilde
+priv_histo$counts <- (priv_histo$counts > 0) * priv_histo$counts 
+
+# normalizing, we want that sum(counts)=m, so that sum(counts/m)=1
+priv_histo$counts <- m*priv_histo$counts/sum(priv_histo$counts)
+  
+# plotting the new hist
+plot(priv_histo,add=F, main = 'Perturbed histogram')  
+curve(original_distro(x),
+      col='darkblue',
+      lwd=3,
+      add=T)
+```
+
+```{r distances, echo=TRUE}
+
+# Quadratic Distance between original_distro and P_cap
+integrate(function(x){quadratic_distance(x,P_cap,original_distro)},0,1,subdivisions = 2000)
+
+
+# Quadratic Distance between original_distro and Q_cap
+integrate(function(x){quadratic_distance(x,Q_cap,original_distro)},0,1,subdivisions = 2000)
+
+```
+
+The following function repeats everything is shown above M times, save the values each time and compute their means. 
+
+```{r mise, echo=TRUE}
+
+
+MISE_PAR <- function(M, m, n, epsilon1,epsilon2){
+  
+  MISE <- function(M, m, n, epsilon1, epsilon2){
+    
+  library("VGAM")
+
+  original_distro <- function(x){
+    return(dbeta(x, 10, 10))
+  }
+  
+  quadratic_distance<-function(x, f, g){
+    return((f(x) - g(x))^2)
+  }
+  Q_cap1 <- function(x){
+  pos<-(x %/% (1/m))
+  
+  return(epsilon1_histo$density[pos+1])
+  }
+  
+  Q_cap2 <- function(x){
+  pos<-(x %/% (1/m))
+  
+  return(epsilon2_histo$density[pos+1])
+  }
+
+  P_cap<-function(x){
+  pos<-(x%/%(1/m))
+  
+  return(original_histo$density[pos+1])
+  }
+
+  
+  Original_MISE <-array(NA,M)
+  epsilon1_MISE <-array(NA,M)
+  epsilon2_MISE <-array(NA,M)
+
+  for(i in 1:M){
+    
+    original_histo = hist(rbeta(n,10,10),    
+                          breaks = c(0:m)*1/m ,
+                          plot = F)
+
+    epsilon1_histo<-original_histo
+
+    noise <- rlaplace(m,scale=(2/epsilon1),location = 0) 
+    
+    epsilon1_histo$counts <- epsilon1_histo$counts + noise 
+
+    epsilon1_histo$counts <- (epsilon1_histo$counts > 0) * epsilon1_histo$counts                  
+    
+    epsilon1_histo$counts <- m*epsilon1_histo$counts/sum(epsilon1_histo$counts)
+    
+    epsilon1_histo$density <- epsilon1_histo$counts 
+    
+    epsilon2_histo<-original_histo
+
+    noise <- rlaplace(m,scale=(2/epsilon2),location = 0) 
+    
+    epsilon2_histo$counts <- epsilon2_histo$counts + noise 
+
+    epsilon2_histo$counts <- (epsilon2_histo$counts > 0) * epsilon2_histo$counts                  
+    
+    epsilon2_histo$counts <- m*epsilon2_histo$counts/sum(epsilon2_histo$counts)
+    
+    epsilon2_histo$density <- epsilon2_histo$counts  
+
+    try(Original_MISE[i] <- integrate(function(x){quadratic_distance(x,P_cap,original_distro)},0,1,subdivisions = 2000)$value)
+    
+    
+    try(epsilon1_MISE[i] <- integrate(function(x){quadratic_distance(x,Q_cap1,original_distro)},0,1,subdivisions = 2000)$value)
+    
+    try(epsilon2_MISE[i] <- integrate(function(x){quadratic_distance(x,Q_cap2,original_distro)},0,1,subdivisions = 2000)$value)
+  }
+  
+  
+  Original_MISE <- sum(Original_MISE)
+  epsilon1_MISE <- sum(epsilon1_MISE)
+  epsilon2_MISE <- sum(epsilon2_MISE)
+
+  
+  return(c(Original_MISE,epsilon1_MISE,epsilon2_MISE))
+}
+  # as always here 2 is the number of cores
+  mise<-foreach(idx= c(1:2),.combine="+") %dopar% {
+    
+    (MISE(M%/%2,m,n,epsilon1,epsilon2))
+    
+  }
+  return(mise/M)
+}
+
+print("MISE:")
+MISE_PAR(500,30,100,0.1,0.001)
+```
+
+Setting the Table
+Initializing a matrix of NA values and setting its colnames and rownames:
+- rows representing m goes from 5 to 50
+- cols are TRUE MISE and PRIV MISE
+
+```{r setting_mise_table, echo=TRUE}
+
+MISE_TABLE <- matrix(data = NA,nrow = 10,ncol = 3)
+colnames(MISE_TABLE) = c("TRUE MISE", "eps = 0.1","eps = 0.001")
+rownames(MISE_TABLE) = c(1:10)
+
+for(i in 1:10) {
+  x<-c("m", i*5)
+  rownames(MISE_TABLE)[i] <- paste(x,collapse = "=")
+}
+
+```
+
+Computing the Table
+Note: for "extremely bad integrand behaviour" we return NA
+
+```{r computing_mise_table, echo=TRUE, results='asis'}
+
+# Associate the MISE corresponding to m given by the row
+for(i in 1:10){
+  try(MISE_TABLE[i,] <- MISE_PAR(500, (i*5), 1000, 0.1,0.001))
+}
+knitr::kable(MISE_TABLE)
+
+```
+
+```{r plot_mise, echo=TRUE}
+
+plot(x=seq(5,50,5),y=MISE_TABLE[, "TRUE MISE"],
+     type="o",
+     ylim=c(0,5),
+     lwd=2,
+     ylab ="MISE",
+     xlab="BINS",
+     main = "MISE with sim_size= 500")
+
+points(x=seq(5,50,5), y=MISE_TABLE[,"eps = 0.1"],
+       type="o",
+       lwd=2,
+       col="red")
+
+points(x=seq(5,50,5), y=MISE_TABLE[,"eps = 0.001"],
+       type="o",
+       lwd=2,
+       col="orange")
+
+legend("topleft",legend = c("eps = 0.1","eps = 0.001","TRUE MISE"),fill =c("red","orange","black"))
+
+```
+
+# 2.2 Simulating over a mixed Beta distribution
+
+We have to define a new model for our population of interest, that is going to be the mixture of two beta random variables. Given $X_1 \sim Beta(\alpha_1,\beta_1)$ and $X_2 \sim Beta(\alpha_2, \beta_2)$, we are going to define the random variable
+\begin{align}
+X \sim \pi ⋅ p_{X_1}(x) + (1-\pi) ⋅ p_{X_2}(x)
+\end{align}
+
+```{r data_plot, echo=TRUE}
+
+sample_1 <- function(x) dbeta(x,10,30)
+sample_2 <- function(x) dbeta(x,15,10)
+
+plot(sample_1, lwd = 2, col='darkred', main = 'Two beta random variables to be mixed: density')
+plot(sample_2, lwd = 2, col='darkblue', add=T)
+
+```
+
+We set our threshold for discriminate the two populations that generates the mixted model.
+```{r threshold, echo=TRUE}
+
+p_p <- 0.25
+
+```
+
+We now define a new distribution from mixing this two betas.
+
+```{r new_distro, echo=TRUE}
+
+new_distribution <- function(x) {
+  return (p_p *sample_1(x) + (1-p_p)*sample_2(x))
+}
+
+plot(new_distribution, col='darkviolet', lwd = 3, main = 'Distribution of the mixture of two beta')
+
+x_vec <- seq(0,1,by=.0001)
+plot(ecdf(new_distribution(x_vec)))
+
+```
+
+Next one is just to verify that our new defined distribution is actually a normalized PDF.
+
+```{r pdf_check, echo=TRUE}
+
+integrate(new_distribution, lower=0, upper=1, subdivisions = 2000)
+
+```
+
+Now we set the same parameters as before to perform the sampling
+
+```{r parameters2, echo=TRUE}
+
+M <- 1000        # simulation size
+n <- 1000        # number of observations
+m <- 30          # number of bins
+
+epsilon <- 0.1   # fixing epsilon
+
+```
+
+We need a method to randomly sample from a mixed beta: the next implemented function does so setting a threshold and sampling uniformly the probability to sample from the first or the second population. 
+
+```{r mixed_beta, echo=TRUE}
+
+r_mixed_beta <- function(n_samples, alpha1, beta1, alpha2, beta2, thresh) {
+  sampled <- rep(NA, n_samples)
+  for (i in 1:n_samples) {
+    pp <- runif(1)
+    if (pp <= thresh) {
+    sampled[i] <- rbeta(1,alpha1,beta1)
+    } 
+    if(pp > thresh) {
+    sampled[i] <- rbeta(1,alpha2,beta2)
+    }
+  }
+  return(sampled)
+}
+
+```
+
+Now we just run the previous function for the values we chose for the mixed model and plot our new histogram.
+
+```{r mixed_beta_run, echo=TRUE}
+set.seed(13112)
+new_sample <- r_mixed_beta (n, 10, 30, 15, 10, .25)
+
+new_histo <- hist(new_sample,    
+             breaks = c(0:m)*1/m ,
+             xlim = c(0,1),
+             main = 'New sample from mixed beta',
+             prob = T)
+
+curve(new_distribution(x),
+      col='darkviolet',
+      lwd=3,
+      add=T)
+
+new_p_cap<-function(x){
+  pos<-(x%/%(1/m))
+  return(new_histo$density[pos+1])
+}
+
+x_vec <- seq(0,1,by=.0001)
+curve(new_p_cap(x))
+
+```
+
+Now we just follow the pattern we walked in the previous simulation, so we are defining a laplacian noise, and we are going to perturbe our histogram.
+
+```{r perturbed_histo, echo=TRUE}
+new_priv_histo <- new_histo
+
+noise <- rlaplace(m,scale=(2/epsilon),location = 0) 
+counts <- new_priv_histo$counts
+counts <- counts + noise 
+counts <- (counts > 0) * counts 
+counts <- m*counts/sum(counts)
+
+new_priv_histo$counts <- counts
+
+new_q_cap<-function(x){
+  pos<-(x%/%(1/m))
+  return(new_priv_histo$counts[pos+1])
+}
+
+plot(new_priv_histo, main = 'New perturbed histogram')  
+curve(new_distribution(x), lwd = 3, col = 'darkviolet',add=T)
+
+```
+
+What we have done up to now is basically the visualization of the setting of one single iteration of the simulation process. Let's have a look to the quadratic distance to complete this setting.
+
+```{r distances2, echo=TRUE}
+
+integrate(function(x){quadratic_distance(x,new_p_cap,new_distribution)},0,1,subdivisions = 2000)
+integrate(function(x){quadratic_distance(x,new_q_cap,new_distribution)},0,1,subdivisions = 2000)
+
+```
+
+Now we are going to define and perform the actual simulation. We just recollect all the function that are needed in the simulation.
+
+```{r simulation, echo=TRUE}
+
+r_mixed_beta <- function(n_samples, alpha1, beta1, alpha2, beta2, thresh) {
+  sampled <- rep(NA, n_samples)
+  for (i in 1:n_samples) {
+    pp <- runif(1)
+    if (pp <= thresh) {
+    sampled[i] <- rbeta(1,alpha1,beta1)
+    } 
+    if(pp > thresh) {
+    sampled[i] <- rbeta(1,alpha2,beta2)
+    }
+  }
+  return(sampled)
+}
+
+```
+
+Now we define a new MISE function.
+
+```{r new_mise, echo=TRUE}
+
+new_MISE_PAR <- function(M,m,n,epsilon){
+  sample_1 <- function(x) dbeta(x,10,30)
+  sample_2 <- function(x) dbeta(x,15,10)
+
+  p_p <- 0.25
+  new_distribution <- function(x) {
+    return (p_p *sample_1(x) + (1-p_p)*sample_2(x))
+  }
+  
+  quadratic_distance<-function(x,f,g){
+    return((f(x)-g(x))^2)
+  }
+
+  r_mixed_beta <- function(n_samples, alpha1, beta1, alpha2, beta2, thresh) {
+    sampled <- rep(NA, n_samples)
+    for (i in 1:n_samples) {
+      pp <- runif(1)
+      if (pp <= thresh) {
+        sampled[i] <- rbeta(1,alpha1,beta1)
+        } 
+      if(pp > thresh) {
+        sampled[i] <- rbeta(1,alpha2,beta2)
+        }
+      }
+  return(sampled)
+    }
+
+  quadratic_distance<-function(x,f,g){
+    return((f(x)-g(x))^2)
+
+  }
+
+  new_MISE <- function(M,m,n,epsilon){
+
+  original_MISE <-c()
+  priv_MISE <- c()
+
+  for(i in 1:M) {
+    new_sample <- r_mixed_beta (n, 10, 30, 15, 10, .25)
+    new_histo <- hist(new_sample,    
+                          breaks = c(0:m)*1/m ,
+                          plot = F)
+    
+    new_priv_histo <- new_histo   
+    noise <- rlaplace(m,scale=(2/epsilon),location = 0) 
+    counts <- new_priv_histo$counts
+    counts <- counts + noise 
+    counts <- (counts > 0) * counts 
+    counts <- m*counts/sum(counts)
+
+    new_priv_histo$counts <- counts
+    new_p_cap<-function(x){
+        pos<-(x%/%(1/m))
+        return(new_histo$density[pos+1])
+      }
+  
+    new_q_cap<-function(x){
+      pos<-(x%/%(1/m))
+      return(new_priv_histo$counts[pos+1])
+      }
+
+    original_MISE<- append(original_MISE,integrate(function(x){quadratic_distance(x,new_p_cap,new_distribution)},0,1,subdivisions = 2000)$value)
+    priv_MISE <- append(priv_MISE,integrate(function(x){quadratic_distance(x,new_q_cap,new_distribution)},0,1,subdivisions = 2000)$value)
+  }
+  
+  original_MISE <- sum(original_MISE)
+  priv_MISE <- sum(priv_MISE)
+  
+  return(c(original_MISE,priv_MISE))
+}
+
+  # as always here 2 is the number of cores
+  new_mised<-foreach(idx= c(1:2),.combine="+") %dopar% {
+    (new_MISE(M%/%2,m,n,epsilon))
+  }
+  return(new_mised/M)
+}
+
+print("MISE:")
+new_MISE_PAR(1000,30,100,0.1)
+
+```
+
+
+```{r new_mise_calculation, echo=TRUE}
+
+new_MISE_table <-matrix(data = NA,nrow = 46,ncol = 2)
+colnames(new_MISE_table)= c("TRUE MISE","PRIV MISE")
+rownames(new_MISE_table)= c(1:46);
+for(i in 1:46) {x<-c("m",i+4);rownames(new_MISE_table)[i]<- paste(x,collapse = "=")}
+
+for(i in 1:46){
+  try(new_MISE_table[i,]<-new_MISE_PAR(1000,(i+4),1000,0.1)) 
+}
+knitr::kable(new_MISE_table)
+
+```
+
+```{r new_mise_plot, echo=TRUE}
+
+plot(x=c(5:50),y=new_MISE_table[, "TRUE MISE"],
+     type="o",
+     ylim=c(0,5),
+     lwd=2,
+     ylab ="MISE",
+     xlab="BINS",
+     main = "MISE with sim_size= 1000")
+
+points(x=c(5:50), y = new_MISE_table[,"PRIV MISE"],
+       type="o",
+       lwd=2,
+       col="red")
+
+legend("topleft",legend = c("PRIV MISE","TRUE MISE"),fill =c("red","black"))
+
+```
+
+## Analysis
+
+The important result is that we can see that there is no informational loss when $m \sim n^{\frac {d}{d+2}}$. In our case $d=1$ so we have that $m \sim n^{\frac{1}{3}}$. We set the size of our sampling to $n=1000$, so our value for m is $m=10$. 
+
+We are going to compare the results we gathered in the two scenarios fixing the value of m and seeing which of the two models behaves the better. 
+
+```{r compare_results, echo=TRUE}
+
+best_one_first_scenario <- MISE_TABLE[10,]
+best_one_second_scenario <- new_MISE_table[10,]
+
+print(best_one_first_scenario)
+print(best_one_second_scenario)
+
+```
+# 2.3 Privatizing an actual dataset
+
+The dataset we are dealing with is an actual result of a survey taken after the first Summer Academy that Dispenso took in the august of 2021. Dispenso is a start up where Leonardo actual work, and this survey was about the students' results in medical university admission test: it was anonymous, so it was already privatized in a sense.
+
+The survey was about many variables, regarding the score, the expected score, the minimum score required in the university they choose, the evaluation of the Dispenso experience, and so on. We just retrieved one variable, the score scored in test, and we have 57 rows in our series.
+
+```{r data_load, echo=TRUE}
+
+data <- read.csv(file = 'dataset.csv', encoding='UTF-8', header=T)
+data <- subset(data, select = -c(Med.test.Score))
+colnames(data) <- c('Score')
+
+data
+
+```
+
+Now we are going to set this as our population of interest and perform the privatization algorithm we used in the previous simulations.
+
+Now we have to tune the parameters of the process: we can choose $m$ leveraging the important result of Wassermann and Zhou, who demonstrated that when $m\sim n^{\frac {d}{d+2}}$ we can see no information loss. In our case $d=1$.
+
+```{r parameters_setting, echo=TRUE}
+n <- length(data$Score)
+m <- ceiling(n^(1/3))
+
+data_histo <- hist(data$Score,
+                   breaks = 8,
+                   main = 'Sample from our dataset',
+                   prob = T)
+
+lines(density(data$Score), lwd=3, col='black')
+```
+
+We initialized $m$ leveraging the important result, but in a data-visualization perspective we found out that maybe a good value for $m$ is a step of two from this setted value.
+
+```{r m_leveraging}
+
+m <- m*2
+
+data_histo <- hist(data$Score,
+                   breaks = m,
+                   main = 'Sample from our dataset',
+                   prob = T)
+
+lines(density(data$Score), lwd=3, col='black')
+
+```
+
+As we have done before, now we perturb the histogram with a laplacian distributed noise.
+
+```{r pertubed_histo, echo=TRUE}
+
+set.seed(1312212)
+epsilons <- c(0.1, 0.01, 0.001, 0.0001)
+
+par(mfrow=c(1,1))
+data_histo <- hist(data$Score,
+     breaks = m,
+     main = 'Histogram from our dataset',
+     prob = T)
+
+lines(density(data$Score), lwd=3, col='black')
+
+
+par(mfrow=c(2,2))
+
+for (i in 1:length(epsilons)) {
+  set.seed(11131223)
+  new_noise <- rlaplace(m,scale=(2/epsilons[i]),location = 0)
+  pert_data <- data_histo
+
+  pert_data$counts <- pert_data$counts + new_noise
+  pert_data$counts <- pert_data$counts*(pert_data$counts > 0)
+  pert_data$counts <- pert_data$counts/sum(pert_data$counts)
+  pert_data$density <- pert_data$counts
+
+  plot(pert_data, main=paste('Perturbed histogram for epsilon=',epsilons[i]))
+  lines(density(data$Score), lwd=3, col='black')
+}
+
+```
+
+As we can see, the more sensitive is our privatization procedure, the more sparsity we induce in the histogram.
+
+Now we want to sample from the perturbed histogram: in order to do this we are going to randomly sample a bin according to the distribution we induced over the original dataset, and then we are randomly sampling over that bin.
+
+In order to randomly choose a bin, we can model a categorical random variable that has $m$ possible outcomes and an associated stochastic vector related to the distribution.
+
+We retrieve the perturbed histogram for $ϵ = 0.1$.
+
+```{r perturbed_histo2, echo=TRUE}
+
+set.seed(11131223)
+epsilon <- 0.1
+new_noise <- rlaplace(m,scale=(2/epsilon),location = 0)
+pert_data <- data_histo
+
+pert_data$counts <- pert_data$counts + new_noise
+pert_data$counts <- pert_data$counts*(pert_data$counts > 0)
+pert_data$counts <- pert_data$counts/sum(pert_data$counts)
+pert_data$density <- pert_data$counts
+
+```
+
+We choose a large enough value for $k$ in order to make the distribution of the k-sampling comparable with the perturbed histogram.
+
+```{r privatized_dataset, echo=TRUE}
+
+privatized_dataset <- rep(NA, 2000)
+
+for (i in 1:2000) {
+  bin <- rcat(1, pert_data$density)
+  priv_sample <- runif(1, min = pert_data$breaks[bin-1], max = pert_data$breaks[bin])
+  privatized_dataset[i] <- priv_sample
+}
+
+hist(privatized_dataset, breaks = m, prob=T)
+
+```
+
+TODO: add comment
+
+```{r}
+
+density1 <- function(x) {
+  pos<-(x%/%(1/m))
+  return(data_histo$density[pos+1])
+}
+
+density2 <- function(x) {
+  pos<-(x%/%(1/m))
+  return(pert_data$density[pos+1])
+}
+
+x_vec <- seq(0, 1, by=0.001)
+
+dens1 <- density1(x_vec)
+dens2 <- density2(x_vec)
+
+ratio <- dens1/dens2
+ratio[is.na(ratio)] <- 0
+
+max(ratio)
+exp(epsilon)
+
+max(ratio) < exp(epsilon)
+
+```
+
+
+
+
+
+
+
+# 2.4 Bonus question
+
+
+Let $A=\{a_1,a_2,...,a_n\}$ and $B=\{b_1,b_2,...,b_n\}$  be two neighbors datasets, i.e. $\exists ! i \in \{1,...,n\} : a_i\not=b_i$.
+
+Let $Z=\{z_1,...,z_n\}$ be the privatized dataset obtained trough the privatized histogram method.
+
+We must show that:
+\[sup_z\ \frac{\mathbb{q}(z_1,...,z_n\ |\ a_1,...,a_n)}{\mathbb{q}(z_1,...,z_n\ |\ b_1,...,b_n)}\leq e^\epsilon.\]
+
+
+
+
+Since the privatized dataset is obtained by randomly sampling from the distribution of the  privatized histogram, the privatization of the data is assured if the histograms are privatized.
+
+Hence let's consider the histograms associated to $A$ and $B$.
+There are 2 possibilities:
+
+1) $a_i$ and $b_i$ fall in the same bin,
+
+2) $a_i$ and $b_i$ are not in the same bin.
+
+In the first case the histogram is per se a privatization of the data set, hence let's focus on the second case. 
+
+
+Let $H'=\{h'_1,...,h'_m\}$ and $H''=\{h''_1,...,h''_m\}$ be the heights of the unnormalized histograms associated to $A$ and $B$.
+Let $T=\{t_1,...,t_n\}$ be the heights of the unnormalized privatized histogram we are given.
+
+Now, we must show that:
+
+\[sup_{(t_1,...,t_m)}\ \frac{\mathbb{q}(t_1,...,t_m\ |\ h'_1,...,h'_m)}{\mathbb{q}(t_1,...,t_m\ |\ h''_1,...,h''_m)}\leq e^\epsilon.\]
+
+Let $H$ be whatever is the right one between $H'$ and $H''$ that actually generates $T$.
+
+$T$ is then obtained by summing $H$ and $m$ samples from a laplacian distribution
+\[f(x)=(\epsilon/4)\ e^{-(\epsilon/2)|x|}\]
+with $0$ mean and $8/\epsilon^2$ variance. 
+
+Let $V=\{v_1,...,v_m\}$ be that sample, then:
+\[\forall i \in \{1,..,m\}, t_i=h_i+v_i\]
+
+Since $v_i$ are sampled independently, and $h_i$ are given (hence fixed),we have that
+\[\mathbb{q}(t_1,...,t_m|h_1,...,h_m)=\prod_{i=1}^m \ f(t_i-h_i)\]
+
+
+Finally we just have to show that:
+\[sup_{(t_1,...,t_m)} \frac{\prod_{i=1}^m \ f(t_i-h'_i)}{\prod_{i=1}^m \ f(t_i-h''_i)}\leq e^{\epsilon}\]
+
+
+For construction we have that $H'$ and $H''$ are equal for all but $2$ heights:
+
+we are in the second case so $a_i$ and $b_i$ are not in the same bin, so there must be $2$ bins, namely $k$ and $j$ such that
+
+
+A): $|h'_k-h''_k|=1$ and $|h'_j-h''_j|=1$.
+
+Hence:
+\[\forall t: \frac{\prod_{i=1}^m \ f(t_i-h'_i)}{\prod_{i=1}^m \ f(t_i-h''_i)}=
+\frac{f(t_k-h'_k)f(t_j-h'_j)}{f(t_k-h''_k)f(t_j-h''_j)}\]
+
+
+
+\[\frac{f(t_k-h'_k)f(t_j-h'_j)}{f(t_k-h''_k)f(t_j-h''_j)}=
+\frac{e^{-(\epsilon/2)(|t_k-h'_k|+|t_j-h'_j|)}}{e^{-(\epsilon/2)(|t_k-h''_k|+|t_j-h''_j|)}}\]
+
+
+
+\[=e^{(\epsilon/2)\{(|t_k-h''_k|+|t_j-h''_j|)-(|t_k-h'_k|+|t_j-h'_j|)\}}\]
+
+\[=
+e^{(\epsilon/2)\{(|t_k-h''_k|-|t_k-h'_k|)+(|t_j-h''_j|-|t_j-h'_j|)\}}
+\]
+
+
+
+\[\leq e^{(\epsilon/2) \ |(|t_k-h''_k|-|t_k-h'_k|)|}
+e^{(\epsilon/2) \ |(|t_j-h''_j|-|t_j-h'_j|)|}\]
+
+
+ using $|(|a|-|b|)|\leq |a-b|$, that's equal to
+
+\[= e^{(\epsilon/2) \ (|h''_k-h'_k|)} \ 
+e^{(\epsilon/2) \ (|h''_j-h'_j|)}\]
+
+by (A) that's equal to \[=e^{(\epsilon/2)} \ e^{(\epsilon/2)}=e^\epsilon.\]
+In conclusion we have established that:
+
+\[\forall t,\frac{\mathbb{q}(t_1,...,t_m\ |\ h'_1,...,h'_m)}{\mathbb{q}(t_1,...,t_m\ |\ h''_1,...,h''_m)}\leq e^\epsilon \] 
+
+and hence that :
+\[sup_ t\ \frac{\mathbb{q}(t_1,...,t_m\ |\ h'_1,...,h'_m)}{\mathbb{q}(t_1,...,t_m\ |\ h''_1,...,h''_m)}\leq e^\epsilon.\]
+
+
+NB: in the proof shown we assumed that $(v_i<-h_i)$ never happens, and hence that $max(0,t_i)$ is always $t_i$, just to not have a too heavy notation, the "general" proof is similar.
+
